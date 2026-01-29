@@ -159,7 +159,7 @@ namespace AlignmentCalc
             List<(int, float, float)> limitedList;
             bool wasLimited = false;
 
-            if (alignments.Count <= MAX_RESULTS)
+            if (alignments.Count <= MAX_DISPLAY_RESULTS)
             {
                 limitedList = new List<(int, float, float)>(alignments);
             }
