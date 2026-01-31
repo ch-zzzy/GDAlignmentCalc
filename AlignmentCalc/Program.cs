@@ -1,115 +1,180 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 
 namespace AlignmentCalc
 {
     internal class Program
     {
         // Speed constants
-        const double SPEED_0_5 = 251.159;
-        const double SPEED_1 = 311.58;
-        const double SPEED_2 = 387.421;
-        const double SPEED_3 = 468.001;
-        const double SPEED_4 = 576.0;
+        const float SPEED_0_5 = 251.16008f;
+        const float SPEED_1 = 311.5801f;
+        const float SPEED_2 = 387.42014f;
+        const float SPEED_3 = 468.00015f;
+        const float SPEED_4 = 576.0002f;
 
-        // Display sampling limit
-        const int MAX_RESULTS = 100;
-
-        // Hard cap for full alignments stored in memory
-        const int MAX_FULL_ALIGNMENTS = 1_000_000;
+        const int MAX_RESULTS = 1000;
+        const int MAX_TICKS = 150_000;
 
         static void Main()
         {
-            double desiredX = PromptDouble("Enter the exact desired xpos: ", min: 0);
+            // Step 1: Xpos prompt
+            var (xMin, xMax, originalInput, actualFloat) = PromptDisplayedX();
 
-            // TPS must not be zero
-            double tps = PromptDouble("Enter the TPS: ", min: 0.0000001);
+            Console.WriteLine($"\nYour input: {originalInput}");
+            Console.WriteLine($"Rounded to float: {actualFloat:F10}");
+            Console.WriteLine($"Float range: [{xMin:F10}, {xMax:F10}]");
+            Console.WriteLine("\nThe 'float range' represents all real numbers that round to this float.\n");
 
-            double speed = PromptSpeed();
+            // Step 2: TPS + leniency prompts
+            float tps = PromptFloat("Enter the TPS: ", min: 0.000001f);
+            float leniency = PromptFloatAllowBlank("Enter positional leniency (leave blank for 0): ", min: 0);
 
-            // Leniency allows blank input → 0
-            double leniency = PromptDoubleAllowBlank("Enter positional leniency (leave blank for 0): ", min: 0);
+            // Step 3: Speed prompt
+            float speed = PromptSpeed();
 
-            double unitsPerTick = speed / tps;
-
-            if (unitsPerTick == 0)
+            // Step 4: dx as GD computes it (float)
+            float dx = speed / tps;
+            if (dx == 0f)
             {
-                Console.WriteLine("Error: unitsPerTick is zero. Check TPS and speed values.");
+                Console.WriteLine("TPS is too high — per‑tick movement rounds to zero.");
                 return;
             }
 
-            int maxTicks = (int)Math.Ceiling(desiredX / unitsPerTick);
-            if (maxTicks <= 0)
+            // Step 5: Calculate maxTicks with 1M limit
+            long maxTicksLong = (long)Math.Ceiling((xMax + leniency) / dx);
+
+            if (maxTicksLong > MAX_TICKS)
             {
-                maxTicks = 1;
+                Console.WriteLine($"Note: Calculation would require {maxTicksLong:N0} ticks.");
+                Console.WriteLine($"Limiting to {MAX_TICKS:N0} ticks for memory and performance.");
+                maxTicksLong = MAX_TICKS;
             }
 
-            Console.WriteLine("\nPlease wait, calculating alignments...");
+            int maxTicks = (int)maxTicksLong;
+
+            // Step 6: Pre-compute backward positions
+            Console.WriteLine("\nPre-computing backward positions...");
+            Stopwatch swCache = Stopwatch.StartNew();
+
+            float[] backwardCache = new float[maxTicks + 1];
+            backwardCache[0] = actualFloat;
+
+            for (int i = 1; i <= maxTicks; i++)
+            {
+                backwardCache[i] = StepBackward(backwardCache[i - 1], dx);
+            }
+
+            swCache.Stop();
+            Console.WriteLine($"Cache built in {swCache.Elapsed.TotalMilliseconds:F2} ms\n");
+
+            // Step 7: Alignment loop (full forward simulation per candidate)
+            Console.WriteLine("Calculating alignments...");
             Stopwatch sw = Stopwatch.StartNew();
 
-            var alignments = new List<(int ticksSincePortal, double portalMin, double portalMax)>();
-            bool capped = false;
-
-            int lastPrintedProgress = -1;
+            var alignments = new List<(int ticksSincePortal, float portalMin, float portalMax)>();
+            int targetBits = BitConverter.SingleToInt32Bits(actualFloat);
 
             for (int ticks = 0; ticks <= maxTicks; ticks++)
             {
-                double centerPortalX = desiredX - ticks * unitsPerTick;
-                double portalMin = centerPortalX - leniency;
-                double portalMax = centerPortalX + leniency;
+                float backwardPos = backwardCache[ticks];
 
-                if (portalMin < 0)
+                // Early exit: once backwardPos < -leniency, no future tick can produce valid portals
+                if (backwardPos < -leniency)
                 {
-                    continue;
-                }
-
-                if (alignments.Count < MAX_FULL_ALIGNMENTS)
-                {
-                    alignments.Add((ticks, portalMin, portalMax));
-                }
-                else
-                {
-                    capped = true;
                     break;
                 }
 
-                int progressPercent = (int)((double)ticks / maxTicks * 100);
-                if (progressPercent != lastPrintedProgress)
+                // Generate up to 3 candidate portal positions
+                int bits = BitConverter.SingleToInt32Bits(backwardPos);
+                float[] candidates = new float[3];
+                int count = 0;
+
+                // prev neighbor
+                if (bits > 0)
                 {
-                    DrawProgressBarWithETA(ticks, maxTicks, sw);
-                    lastPrintedProgress = progressPercent;
+                    float prev = BitConverter.Int32BitsToSingle(bits - 1);
+                    if (prev >= 0f)
+                    {
+                        candidates[count++] = prev;
+                    }
+                }
+
+                // exact
+                if (backwardPos >= 0f)
+                {
+                    candidates[count++] = backwardPos;
+                }
+
+                // next neighbor
+                float next = BitConverter.Int32BitsToSingle(bits + 1);
+                if (next >= 0f)
+                {
+                    candidates[count++] = next;
+                }
+
+                float? bestPortal = null;
+                float bestDistance = float.MaxValue;
+
+                // Full forward simulation for each candidate
+                for (int i = 0; i < count; i++)
+                {
+                    float cand = candidates[i];
+                    float pos = cand;
+
+                    // simulate forward ticks times
+                    for (int t = 0; t < ticks; t++)
+                    {
+                        pos = StepForward(pos, dx);
+                    }
+
+                    if (BitConverter.SingleToInt32Bits(pos) == targetBits)
+                    {
+                        float dist = Math.Abs(cand);
+                        if (dist < bestDistance)
+                        {
+                            bestDistance = dist;
+                            bestPortal = cand;
+                        }
+                    }
+                }
+
+                // Record alignment
+                if (bestPortal.HasValue)
+                {
+                    float portalMin = MathF.Max(0f, bestPortal.Value - leniency);
+                    float portalMax = bestPortal.Value + leniency;
+                    alignments.Add((ticks, portalMin, portalMax));
+                }
+
+                if (ticks % 1000 == 0 && ticks > 0)
+                {
+                    double elapsed = sw.Elapsed.TotalSeconds;
+                    Console.Write($"\rTicks checked: {ticks}  Elapsed: {elapsed:F2}s");
                 }
             }
 
-            DrawProgressBarWithETA(maxTicks, maxTicks, sw);
             sw.Stop();
-            Console.WriteLine($" Done in {sw.Elapsed.TotalSeconds:F2} sec.\n");
+            Console.WriteLine($"\rDone in {sw.Elapsed.TotalSeconds:F2} sec (cache: {swCache.Elapsed.TotalSeconds:F2}s, search: {sw.Elapsed.TotalSeconds:F2}s)\n");
 
-            if (capped)
-            {
-                Console.WriteLine("The alignments list reached the 1,000,000‑item cap and was stopped early.");
-                Console.WriteLine("(This prevents excessive memory usage.)\n");
-            }
-
-            // Build limited list for display
-            List<(int, double, double)> limitedList;
+            // Step 8: Limit for display
+            List<(int, float, float)> limitedList;
             bool wasLimited = false;
 
             if (alignments.Count <= MAX_RESULTS)
             {
-                limitedList = new List<(int, double, double)>(alignments);
+                limitedList = new List<(int, float, float)>(alignments);
             }
             else
             {
                 wasLimited = true;
 
-                limitedList = new List<(int, double, double)>
+                limitedList = new List<(int, float, float)>
                 {
                     alignments[0],
-                    alignments[alignments.Count - 1]
+                    alignments[^1]
                 };
 
                 int samples = MAX_RESULTS - limitedList.Count;
-                double step = (double)alignments.Count / samples;
+                float step = (float)alignments.Count / samples;
 
                 for (int i = 1; i < samples; i++)
                 {
@@ -125,22 +190,21 @@ namespace AlignmentCalc
             }
 
             Console.WriteLine("\nAlignments:");
-            PrintAlignments(limitedList, leniency);
+            PrintAlignments(limitedList);
 
-            if (wasLimited || capped)
+            if (alignments.Count > 0)
             {
-                Console.WriteLine($"\nNote: This list does not contain all alignments. ({alignments.Count})");
-                Console.Write("Show full list, export to CSV, or skip? (f/c/n): ");
+                if (wasLimited)
+                {
+                    Console.WriteLine($"\nNote: This list does not contain all {alignments.Count:N0} alignments.");
+                }
+
+                Console.Write("\nExport to CSV? (y/n): ");
                 string input = Console.ReadLine()?.Trim().ToLower() ?? "n";
 
-                if (input == "f")
+                if (input == "y")
                 {
-                    Console.WriteLine("\nFull list of alignments:");
-                    PrintAlignments(alignments, leniency);
-                }
-                else if (input == "c")
-                {
-                    ExportCSV(alignments, leniency);
+                    ExportCSV(alignments);
                 }
             }
 
@@ -148,11 +212,43 @@ namespace AlignmentCalc
             Console.ReadKey();
         }
 
-        static double PromptDouble(string prompt, double min = double.NegativeInfinity)
+        // ==================== GD PHYSICS ====================
+
+        static float StepForward(float pos, float dx) => (float)(pos + dx);
+        static float StepBackward(float pos, float dx) => (float)(pos - dx);
+
+        // ==================== INPUT / OUTPUT ====================
+
+        static (float, float, string, float) PromptDisplayedX()
         {
-            double val;
+            while (true)
+            {
+                Console.Write("Enter desired xpos (as shown in-game, 6 decimals): ");
+                string input = Console.ReadLine()?.Trim() ?? "";
+
+                if (float.TryParse(input, out float displayedX) && displayedX >= 0)
+                {
+                    float actualFloat = displayedX;
+                    int bits = BitConverter.SingleToInt32Bits(actualFloat);
+
+                    float prev = bits > 0 ? BitConverter.Int32BitsToSingle(bits - 1) : 0f;
+                    float next = BitConverter.Int32BitsToSingle(bits + 1);
+
+                    float xMin = MathF.Max(0, prev);
+                    float xMax = next;
+
+                    return (xMin, xMax, input, actualFloat);
+                }
+
+                Console.WriteLine("Invalid input. Enter a number with up to 6 decimals.");
+            }
+        }
+
+        static float PromptFloat(string prompt, float min = float.NegativeInfinity)
+        {
+            float val;
             Console.Write(prompt);
-            while (!double.TryParse(Console.ReadLine(), out val) || val < min)
+            while (!float.TryParse(Console.ReadLine(), out val) || val < min)
             {
                 Console.Write($"Invalid input. {prompt}");
             }
@@ -160,20 +256,18 @@ namespace AlignmentCalc
             return val;
         }
 
-        // Allows blank input → returns 0
-        static double PromptDoubleAllowBlank(string prompt, double min = double.NegativeInfinity)
+        static float PromptFloatAllowBlank(string prompt, float min = float.NegativeInfinity)
         {
             while (true)
             {
                 Console.Write(prompt);
                 string input = Console.ReadLine()?.Trim() ?? "";
-
                 if (string.IsNullOrWhiteSpace(input))
                 {
                     return 0;
                 }
 
-                if (double.TryParse(input, out double val) && val >= min)
+                if (float.TryParse(input, out float val) && val >= min)
                 {
                     return val;
                 }
@@ -182,7 +276,7 @@ namespace AlignmentCalc
             }
         }
 
-        static double PromptSpeed()
+        static float PromptSpeed()
         {
             while (true)
             {
@@ -200,88 +294,25 @@ namespace AlignmentCalc
             }
         }
 
-        static void DrawProgressBarWithETA(int currentTick, int maxTicks, Stopwatch sw)
+        static void PrintAlignments(List<(int ticksSincePortal, float portalMin, float portalMax)> list)
         {
-            const int totalBlocks = 40;
-            int filled = (int)((double)currentTick / Math.Max(maxTicks, 1) * totalBlocks);
-
-            double elapsedSeconds = sw.Elapsed.TotalSeconds;
-            double progressFraction = maxTicks == 0 ? 1 : (double)currentTick / maxTicks;
-            double estimatedTotal = elapsedSeconds / Math.Max(progressFraction, 0.00001);
-            double etaSeconds = estimatedTotal - elapsedSeconds;
-
-            int etaMin = (int)(etaSeconds / 60);
-            int etaSec = (int)(etaSeconds % 60);
-
-            Console.Write("\r[");
-            Console.Write(new string('█', filled));
-            Console.Write(new string(' ', totalBlocks - filled));
-            Console.Write($"] {progressFraction * 100,3:F0}% ETA: {etaMin:D2}:{etaSec:D2}");
-        }
-
-        static void PrintAlignments(List<(int ticksSincePortal, double portalMin, double portalMax)> list, double leniency)
-        {
-            bool collapse = leniency == 0;
-
-            if (collapse)
+            Console.WriteLine($"{"Ticks since portal hit",-24} | {"portalX_min",-24} | {"portalX_max",-24}");
+            Console.WriteLine(new string('-', 80));
+            foreach (var a in list)
             {
-                Console.WriteLine(
-                    $"{"Ticks since portal hit",-24} | {"portalX",-24}"
-                );
-                Console.WriteLine(new string('-', 55));
-
-                foreach (var a in list)
-                {
-                    Console.WriteLine(
-                        $"{a.ticksSincePortal,24} | {a.portalMin,24:F9}"
-                    );
-                    Console.WriteLine(new string('-', 55));
-                }
-            }
-            else
-            {
-                Console.WriteLine(
-                    $"{"Ticks since portal hit",-24} | {"portalX_min",-24} | {"portalX_max",-24}"
-                );
-                Console.WriteLine(new string('-', 80));
-
-                foreach (var a in list)
-                {
-                    Console.WriteLine(
-                        $"{a.ticksSincePortal,24} | " +
-                        $"{a.portalMin,24:F9} | " +
-                        $"{a.portalMax,24:F9}"
-                    );
-                    Console.WriteLine(new string('-', 80));
-                }
+                Console.WriteLine($"{a.ticksSincePortal,24} | {a.portalMin,24:F6} | {a.portalMax,24:F6}");
             }
         }
 
-        static void ExportCSV(List<(int ticksSincePortal, double portalMin, double portalMax)> list, double leniency)
+        static void ExportCSV(List<(int ticksSincePortal, float portalMin, float portalMax)> list)
         {
-            bool collapse = leniency == 0;
-
             string timestamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
             string fileName = $"alignments_{timestamp}.csv";
-
-            using (var writer = new StreamWriter(fileName))
+            using var writer = new StreamWriter(fileName);
+            writer.WriteLine("ticks_since_portal,portalX_min,portalX_max");
+            foreach (var a in list)
             {
-                if (collapse)
-                {
-                    writer.WriteLine("ticks_since_portal,portalX");
-                    foreach (var a in list)
-                    {
-                        writer.WriteLine($"{a.ticksSincePortal},{a.portalMin:F9}");
-                    }
-                }
-                else
-                {
-                    writer.WriteLine("ticks_since_portal,portalX_min,portalX_max");
-                    foreach (var a in list)
-                    {
-                        writer.WriteLine($"{a.ticksSincePortal},{a.portalMin:F9},{a.portalMax:F9}");
-                    }
-                }
+                writer.WriteLine($"{a.ticksSincePortal},{a.portalMin:F6},{a.portalMax:F6}");
             }
 
             Console.WriteLine($"\nCSV exported successfully to: {Path.GetFullPath(fileName)}");
