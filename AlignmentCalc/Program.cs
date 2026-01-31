@@ -11,7 +11,7 @@ namespace AlignmentCalc
         const float SPEED_3 = 468.00015f;
         const float SPEED_4 = 576.0002f;
 
-        const int MAX_RESULTS = 1000;
+        const int MAX_DISPLAY_RESULTS = 1000;
         const int MAX_TICKS = 150_000;
 
         static void Main()
@@ -41,15 +41,53 @@ namespace AlignmentCalc
 
             // Step 5: Calculate maxTicks with 1M limit
             long maxTicksLong = (long)Math.Ceiling((xMax + leniency) / dx);
+            int maxTicks = (int)maxTicksLong;
+
+            // -------------------------------
+            // Warm-up calibration for runtime
+            // -------------------------------
+            int warmupTicks = 5000;
+            Stopwatch warmupSW = Stopwatch.StartNew();
+
+            float warmupPos = actualFloat;
+            for (int t = 0; t < warmupTicks; t++)
+            {
+                for (int j = 0; j < t; j++)
+                {
+                    warmupPos = StepForward(warmupPos, dx);
+                }
+            }
+
+            warmupSW.Stop();
+            double warmupSeconds = warmupSW.Elapsed.TotalSeconds;
+            double k = warmupSeconds / (warmupTicks * (double)warmupTicks);
 
             if (maxTicksLong > MAX_TICKS)
             {
-                Console.WriteLine($"Note: Calculation would require {maxTicksLong:N0} ticks.");
-                Console.WriteLine($"Limiting to {MAX_TICKS:N0} ticks for memory and performance.");
-                maxTicksLong = MAX_TICKS;
-            }
+                double estimatedSeconds = k * maxTicksLong * maxTicksLong;
 
-            int maxTicks = (int)maxTicksLong;
+                int estMinutes = (int)(estimatedSeconds / 60);
+                int estSeconds = (int)(estimatedSeconds % 60);
+
+                Console.WriteLine($"Note: Calculation would require {maxTicksLong:N0} ticks (~{estMinutes}:{estSeconds:D2}).");
+                Console.Write($"Continue? (y/n, or press Enter for {MAX_TICKS:N0} limit): ");
+
+                string response = Console.ReadLine()?.Trim().ToLower() ?? "";
+
+                if (response == "y" || response == "yes")
+                {
+                    maxTicks = (int)Math.Min(maxTicksLong, 1_000_000);
+                    if (maxTicks == 1_000_000)
+                    {
+                        Console.WriteLine($"Limited to hard cap of 1,000,000 ticks.");
+                    }
+                }
+                else
+                {
+                    Console.WriteLine($"Limiting to {MAX_TICKS:N0} ticks.");
+                    maxTicks = MAX_TICKS;
+                }
+            }
 
             // Step 6: Pre-compute backward positions
             Console.WriteLine("\nPre-computing backward positions...");
@@ -66,7 +104,7 @@ namespace AlignmentCalc
             swCache.Stop();
             Console.WriteLine($"Cache built in {swCache.Elapsed.TotalMilliseconds:F2} ms\n");
 
-            // Step 7: Alignment loop (full forward simulation per candidate)
+            // Step 7: Alignment loop
             Console.WriteLine("Calculating alignments...");
             Stopwatch sw = Stopwatch.StartNew();
 
@@ -77,7 +115,6 @@ namespace AlignmentCalc
             {
                 float backwardPos = backwardCache[ticks];
 
-                // Early exit: once backwardPos < -leniency, no future tick can produce valid portals
                 if (backwardPos < -leniency)
                 {
                     break;
@@ -88,7 +125,6 @@ namespace AlignmentCalc
                 float[] candidates = new float[3];
                 int count = 0;
 
-                // prev neighbor
                 if (bits > 0)
                 {
                     float prev = BitConverter.Int32BitsToSingle(bits - 1);
@@ -98,13 +134,11 @@ namespace AlignmentCalc
                     }
                 }
 
-                // exact
                 if (backwardPos >= 0f)
                 {
                     candidates[count++] = backwardPos;
                 }
 
-                // next neighbor
                 float next = BitConverter.Int32BitsToSingle(bits + 1);
                 if (next >= 0f)
                 {
@@ -114,13 +148,12 @@ namespace AlignmentCalc
                 float? bestPortal = null;
                 float bestDistance = float.MaxValue;
 
-                // Full forward simulation for each candidate
+                // Full forward simulation
                 for (int i = 0; i < count; i++)
                 {
                     float cand = candidates[i];
                     float pos = cand;
 
-                    // simulate forward ticks times
                     for (int t = 0; t < ticks; t++)
                     {
                         pos = StepForward(pos, dx);
@@ -137,7 +170,6 @@ namespace AlignmentCalc
                     }
                 }
 
-                // Record alignment
                 if (bestPortal.HasValue)
                 {
                     float portalMin = MathF.Max(0f, bestPortal.Value - leniency);
@@ -145,10 +177,26 @@ namespace AlignmentCalc
                     alignments.Add((ticks, portalMin, portalMax));
                 }
 
+                // Quadratic ETA
                 if (ticks % 1000 == 0 && ticks > 0)
                 {
                     double elapsed = sw.Elapsed.TotalSeconds;
-                    Console.Write($"\rTicks checked: {ticks}  Elapsed: {elapsed:F2}s");
+                    double progress = (double)ticks * ticks / (maxTicks * (double)maxTicks);
+
+                    if (progress > 0.001)
+                    {
+                        double estimatedTotal = elapsed / progress;
+                        double eta = Math.Max(0, estimatedTotal - elapsed);
+
+                        int etaMinutes = (int)(eta / 60);
+                        int etaSeconds = (int)(eta % 60);
+
+                        Console.Write($"\rProgress: {ticks:N0}/{maxTicks:N0} ({progress:P1})  ETA: {etaMinutes}:{etaSeconds:D2}");
+                    }
+                    else
+                    {
+                        Console.Write($"\rProgress: {ticks:N0}/{maxTicks:N0} (warming up...)");
+                    }
                 }
             }
 
@@ -173,7 +221,7 @@ namespace AlignmentCalc
                     alignments[^1]
                 };
 
-                int samples = MAX_RESULTS - limitedList.Count;
+                int samples = MAX_DISPLAY_RESULTS - limitedList.Count;
                 float step = (float)alignments.Count / samples;
 
                 for (int i = 1; i < samples; i++)
